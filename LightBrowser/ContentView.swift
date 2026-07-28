@@ -509,6 +509,8 @@ final class BrowserStore {
         guard !tab.isClipboard else { return }
         guard tabs.count > 1 else { return }
         let wasSelected = tab.id == selectedTabID
+        let orderedTabsBeforeClose = sidebarOrderedTabs
+        let closedTabIndex = orderedTabsBeforeClose.firstIndex { $0.id == tab.id }
         if wasSelected {
             prepareActiveTabForBackground()
         }
@@ -516,7 +518,7 @@ final class BrowserStore {
         tabs.removeAll { $0.id == tab.id }
 
         if wasSelected {
-            selectedTabID = tabs.last?.id
+            selectedTabID = replacementSelectedTabID(afterClosingTabAt: closedTabIndex)
             addressText = selectedTab?.url.absoluteString ?? ""
         }
 
@@ -526,6 +528,23 @@ final class BrowserStore {
     func closeSelectedTab() {
         guard let selectedTab else { return }
         close(selectedTab)
+    }
+
+    private func replacementSelectedTabID(afterClosingTabAt closedTabIndex: Int?) -> BrowserTab.ID? {
+        let orderedTabs = sidebarOrderedTabs
+        guard !orderedTabs.isEmpty else {
+            let tab = BrowserTab()
+            tabs.append(tab)
+            recordTabOpened()
+            return tab.id
+        }
+
+        guard let closedTabIndex else {
+            return orderedTabs.last?.id
+        }
+
+        let replacementIndex = min(closedTabIndex, orderedTabs.count - 1)
+        return orderedTabs[replacementIndex].id
     }
 
     func createGroup() {
