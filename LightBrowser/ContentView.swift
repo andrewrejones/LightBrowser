@@ -179,6 +179,7 @@ final class BrowserStore {
     var isLoading = false
     var estimatedProgress = 0.0
     var pageErrorMessage: String?
+    var pageRecoveryURL: URL?
     var downloadMessage: String?
     var tabSearchFocusRequest = 0
     var tabsOpenedToday = 0
@@ -913,6 +914,7 @@ final class BrowserStore {
 
     func clearPageError() {
         pageErrorMessage = nil
+        pageRecoveryURL = nil
     }
 
     func clearPageError(from webView: WKWebView) {
@@ -922,11 +924,18 @@ final class BrowserStore {
 
     func showPageError(_ error: Error) {
         pageErrorMessage = error.localizedDescription
+        pageRecoveryURL = selectedTab?.url.isGoogleAccountURL == true ? selectedTab?.url : nil
     }
 
     func showPageError(_ error: Error, from webView: WKWebView) {
         guard self.webView === webView else { return }
-        showPageError(error)
+        let recoveryURL = webView.url ?? selectedTab?.url
+        if recoveryURL?.isGoogleAccountURL == true {
+            pageErrorMessage = "Google blocks account sign-in inside embedded web views. Open this page in Safari to complete Google login."
+            pageRecoveryURL = recoveryURL
+        } else {
+            showPageError(error)
+        }
     }
 
     func beginDownload(_ download: WKDownload) {
@@ -953,6 +962,11 @@ final class BrowserStore {
     func openSelectedPageInSafari() {
         guard let url = selectedTab?.url, url.scheme == "http" || url.scheme == "https" else { return }
         BrowserSystemActions.openInSafari(url)
+    }
+
+    func openRecoveryPageInSafari() {
+        guard let pageRecoveryURL else { return }
+        BrowserSystemActions.openInSafari(pageRecoveryURL)
     }
 
     func clearClipboardHistory() {
@@ -1304,6 +1318,13 @@ private extension URL {
         scheme == "http" || scheme == "https"
     }
 
+    var isGoogleAccountURL: Bool {
+        guard let host = host(percentEncoded: false)?.lowercased() else { return false }
+        return host == "accounts.google.com"
+            || host == "mail.google.com"
+            || host.hasSuffix(".accounts.google.com")
+    }
+
     var isRestorableBrowserURL: Bool {
         scheme != "webkit-extension" && scheme != "lightbrowser"
     }
@@ -1561,7 +1582,9 @@ struct ContentView: View {
                     .opacity(store.isLoading ? 1 : 0)
                     .frame(height: 2)
                 if let pageErrorMessage = store.pageErrorMessage {
-                    BrowserErrorBanner(message: pageErrorMessage)
+                    BrowserErrorBanner(message: pageErrorMessage, recoveryURL: store.pageRecoveryURL) {
+                        store.openRecoveryPageInSafari()
+                    }
                 }
                 if let downloadMessage = store.downloadMessage {
                     BrowserStatusBanner(systemImage: "arrow.down.circle", message: downloadMessage)
@@ -2200,15 +2223,29 @@ private struct AddressField: View {
 
 private struct BrowserErrorBanner: View {
     let message: String
+    let recoveryURL: URL?
+    let recoveryAction: () -> Void
 
     var body: some View {
-        BrowserStatusBanner(systemImage: "exclamationmark.triangle", message: message)
+        BrowserStatusBanner(systemImage: "exclamationmark.triangle", message: message) {
+            if recoveryURL != nil {
+                Button("Open in Safari", action: recoveryAction)
+                    .controlSize(.small)
+            }
+        }
     }
 }
 
-private struct BrowserStatusBanner: View {
+private struct BrowserStatusBanner<Accessory: View>: View {
     let systemImage: String
     let message: String
+    let accessory: Accessory
+
+    init(systemImage: String, message: String, @ViewBuilder accessory: () -> Accessory) {
+        self.systemImage = systemImage
+        self.message = message
+        self.accessory = accessory()
+    }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -2216,12 +2253,21 @@ private struct BrowserStatusBanner: View {
             Text(message)
                 .lineLimit(2)
             Spacer()
+            accessory
         }
         .font(.caption)
         .foregroundStyle(.secondary)
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(.quaternary)
+    }
+}
+
+private extension BrowserStatusBanner where Accessory == EmptyView {
+    init(systemImage: String, message: String) {
+        self.systemImage = systemImage
+        self.message = message
+        self.accessory = EmptyView()
     }
 }
 
