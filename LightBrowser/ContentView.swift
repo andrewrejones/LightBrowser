@@ -199,8 +199,10 @@ final class BrowserStore {
     @ObservationIgnored private let webCoordinator = BrowserWebCoordinator()
     @ObservationIgnored private let downloadManager = BrowserDownloadManager()
     @ObservationIgnored private var webView: WKWebView?
+    @ObservationIgnored private weak var activeWebContainer: BrowserPlatformView?
     @ObservationIgnored private var webViews: [BrowserTab.ID: WKWebView] = [:]
     @ObservationIgnored private var webViewTabIDs: [ObjectIdentifier: BrowserTab.ID] = [:]
+    @ObservationIgnored private var webViewCompatibilityModes: [BrowserTab.ID: Bool] = [:]
     @ObservationIgnored private var webViewLastUsed: [BrowserTab.ID: Date] = [:]
     @ObservationIgnored private var requestedURLs: [BrowserTab.ID: URL] = [:]
     @ObservationIgnored private var loadStartTimes: [BrowserTab.ID: Date] = [:]
@@ -327,6 +329,7 @@ final class BrowserStore {
 
     fileprivate func displaySelectedTab(in container: BrowserPlatformView) {
         guard let tab = selectedTab else { return }
+        activeWebContainer = container
         let selectedWebView = cachedWebView(for: tab)
         let didChangeActiveWebView = webView !== selectedWebView
 
@@ -345,8 +348,7 @@ final class BrowserStore {
 
         if didChangeActiveWebView {
             webCoordinator.observe(selectedWebView)
-            BrowserExtensionManager.shared.registerActiveBrowser(store: self, webView: selectedWebView)
-            installCompiledContentRuleListIfNeeded(on: selectedWebView)
+            registerBrowserFeaturesIfNeeded(on: selectedWebView, for: tab)
         }
         loadSelectedTabIfNeeded()
         ensureDisplayedTabIsLoadingIfBlank(tab, webView: selectedWebView)
@@ -656,6 +658,8 @@ final class BrowserStore {
             return
         }
 
+        switchSelectedWebViewIfNeeded(for: url)
+
         if webView?.url == url {
             if let webView {
                 restoreScrollPositionIfNeeded(in: webView)
@@ -680,24 +684,88 @@ final class BrowserStore {
     }
 
     private func cachedWebView(for tab: BrowserTab) -> WKWebView {
-        if let cachedWebView = webViews[tab.id] {
+        let compatibilityMode = tab.url.requiresGoogleCompatibilityMode
+
+        if let cachedWebView = webViews[tab.id],
+           webViewCompatibilityModes[tab.id] == compatibilityMode {
             return cachedWebView
         }
 
-        let cachedWebView = WKWebView(frame: .zero, configuration: browserConfiguration(isIncognito: tab.isIncognito))
-        configure(cachedWebView, for: tab.id)
+        removeCachedWebView(for: tab.id)
+
+        let cachedWebView = WKWebView(frame: .zero, configuration: browserConfiguration(isIncognito: tab.isIncognito, googleCompatibilityMode: compatibilityMode))
+        configure(cachedWebView, for: tab.id, googleCompatibilityMode: compatibilityMode)
         webViews[tab.id] = cachedWebView
+        webViewCompatibilityModes[tab.id] = compatibilityMode
         webViewLastUsed[tab.id] = Date()
         return cachedWebView
     }
 
-    private func configure(_ webView: WKWebView, for tabID: BrowserTab.ID) {
-        webView.customUserAgent = BrowserDefaults.desktopSafariUserAgent
+    private func configure(_ webView: WKWebView, for tabID: BrowserTab.ID, googleCompatibilityMode: Bool) {
+        if !googleCompatibilityMode {
+            webView.customUserAgent = BrowserDefaults.desktopSafariUserAgent
+        }
         webView.allowsBackForwardNavigationGestures = true
         webView.navigationDelegate = webCoordinator
         webView.uiDelegate = webCoordinator
         webViewTabIDs[ObjectIdentifier(webView)] = tabID
+        if !googleCompatibilityMode {
+            installCompiledContentRuleListIfNeeded(on: webView)
+        }
+    }
+
+    private func registerBrowserFeaturesIfNeeded(on webView: WKWebView, for tab: BrowserTab) {
+        guard !tab.url.requiresGoogleCompatibilityMode else { return }
+        BrowserExtensionManager.shared.registerActiveBrowser(store: self, webView: webView)
         installCompiledContentRuleListIfNeeded(on: webView)
+    }
+
+    private func switchSelectedWebViewIfNeeded(for url: URL) {
+        guard let selectedTabID,
+              webViews[selectedTabID] != nil,
+              webViewCompatibilityModes[selectedTabID] != url.requiresGoogleCompatibilityMode else {
+            return
+        }
+
+        replaceCachedWebView(for: selectedTabID, loading: url)
+    }
+
+    func switchWebViewIfNeededForNavigation(to url: URL, from webView: WKWebView) -> Bool {
+        guard url.isLoadableInMainBrowser,
+              let tabID = tabID(for: webView),
+              webViewCompatibilityModes[tabID] != url.requiresGoogleCompatibilityMode else {
+            return false
+        }
+
+        replaceCachedWebView(for: tabID, loading: url)
+        return true
+    }
+
+    private func replaceCachedWebView(for tabID: BrowserTab.ID, loading url: URL) {
+        removeCachedWebView(for: tabID)
+
+        guard let index = tabs.firstIndex(where: { $0.id == tabID }) else { return }
+        requestedURLs[tabID] = url
+        let replacementWebView = cachedWebView(for: tabs[index])
+
+        guard tabID == selectedTabID else { return }
+        webView = replacementWebView
+        webCoordinator.observe(replacementWebView)
+        registerBrowserFeaturesIfNeeded(on: replacementWebView, for: tabs[index])
+        updateNavigationState(from: replacementWebView)
+
+        if let activeWebContainer {
+            if replacementWebView.superview !== activeWebContainer {
+                replacementWebView.removeFromSuperview()
+                embed(replacementWebView, in: activeWebContainer)
+            }
+
+            for subview in activeWebContainer.subviews where subview !== replacementWebView {
+                subview.removeFromSuperview()
+            }
+        }
+
+        replacementWebView.load(URLRequest(url: url))
     }
 
     private func removeCachedWebView(for tabID: BrowserTab.ID) {
@@ -707,6 +775,7 @@ final class BrowserStore {
         let identifier = ObjectIdentifier(cachedWebView)
         webViewTabIDs[identifier] = nil
         installedContentRuleListWebViewIDs.remove(identifier)
+        webViewCompatibilityModes[tabID] = nil
         webViewLastUsed[tabID] = nil
         if webView === cachedWebView {
             webView = nil
@@ -1343,6 +1412,10 @@ private extension URL {
             || host.hasSuffix(".accounts.google.com")
     }
 
+    var requiresGoogleCompatibilityMode: Bool {
+        isGoogleAccountURL
+    }
+
     var isRestorableBrowserURL: Bool {
         scheme != "webkit-extension" && scheme != "lightbrowser"
     }
@@ -1439,6 +1512,10 @@ private final class BrowserWebCoordinator: NSObject, WKNavigationDelegate, WKUID
             if navigationAction.targetFrame?.isMainFrame != false,
                let url = navigationAction.request.url {
                 store?.beginNavigation(to: url, from: webView)
+                if store?.switchWebViewIfNeededForNavigation(to: url, from: webView) == true {
+                    decisionHandler(.cancel)
+                    return
+                }
             }
             decisionHandler(.allow)
         }
@@ -2368,15 +2445,17 @@ private struct WebContentView: UIViewRepresentable {
 }
 #endif
 
-private func browserConfiguration(isIncognito: Bool = false) -> WKWebViewConfiguration {
+private func browserConfiguration(isIncognito: Bool = false, googleCompatibilityMode: Bool = false) -> WKWebViewConfiguration {
     let configuration = WKWebViewConfiguration()
     configuration.websiteDataStore = isIncognito ? .nonPersistent() : .default()
     configuration.allowsAirPlayForMediaPlayback = true
     configuration.defaultWebpagePreferences.allowsContentJavaScript = true
     configuration.defaultWebpagePreferences.preferredContentMode = .desktop
-    configuration.userContentController.addUserScript(passwordAutoFillAssistUserScript())
-    configuration.userContentController.addUserScript(cookieConsentUserScript())
-    configuration.webExtensionController = BrowserExtensionManager.shared.controller
+    if !googleCompatibilityMode {
+        configuration.userContentController.addUserScript(passwordAutoFillAssistUserScript())
+        configuration.userContentController.addUserScript(cookieConsentUserScript())
+        configuration.webExtensionController = BrowserExtensionManager.shared.controller
+    }
     return configuration
 }
 
