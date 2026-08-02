@@ -427,6 +427,11 @@ final class BrowserStore {
         add(tab, openInBackground: openInBackground)
     }
 
+    func openExternalURL(_ url: URL) {
+        guard url.isWebURL else { return }
+        newTab(url: url)
+    }
+
     func openClipboardTab() {
         if let clipboardTab = tabs.first(where: \.isClipboard) {
             select(clipboardTab)
@@ -1598,6 +1603,9 @@ struct ContentView: View {
         }
         .navigationSplitViewStyle(.balanced)
         .focusedSceneValue(store)
+        .onOpenURL { url in
+            store.openExternalURL(url)
+        }
     }
 }
 
