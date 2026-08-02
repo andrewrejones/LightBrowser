@@ -202,7 +202,7 @@ final class BrowserStore {
     @ObservationIgnored private weak var activeWebContainer: BrowserPlatformView?
     @ObservationIgnored private var webViews: [BrowserTab.ID: WKWebView] = [:]
     @ObservationIgnored private var webViewTabIDs: [ObjectIdentifier: BrowserTab.ID] = [:]
-    @ObservationIgnored private var webViewCompatibilityModes: [BrowserTab.ID: Bool] = [:]
+    @ObservationIgnored private var webViewIdentityCompatibilityModes: [BrowserTab.ID: Bool] = [:]
     @ObservationIgnored private var webViewLastUsed: [BrowserTab.ID: Date] = [:]
     @ObservationIgnored private var requestedURLs: [BrowserTab.ID: URL] = [:]
     @ObservationIgnored private var loadStartTimes: [BrowserTab.ID: Date] = [:]
@@ -684,10 +684,10 @@ final class BrowserStore {
     }
 
     private func cachedWebView(for tab: BrowserTab) -> WKWebView {
-        let compatibilityMode = tab.url.requiresGoogleCompatibilityMode
+        let compatibilityMode = tab.url.requiresIdentityCompatibilityMode
 
         if let cachedWebView = webViews[tab.id],
-           webViewCompatibilityModes[tab.id] == compatibilityMode {
+           webViewIdentityCompatibilityModes[tab.id] == compatibilityMode {
             return cachedWebView
         }
 
@@ -696,7 +696,7 @@ final class BrowserStore {
         let cachedWebView = WKWebView(frame: .zero, configuration: browserConfiguration(isIncognito: tab.isIncognito, googleCompatibilityMode: compatibilityMode))
         configure(cachedWebView, for: tab.id, googleCompatibilityMode: compatibilityMode)
         webViews[tab.id] = cachedWebView
-        webViewCompatibilityModes[tab.id] = compatibilityMode
+        webViewIdentityCompatibilityModes[tab.id] = compatibilityMode
         webViewLastUsed[tab.id] = Date()
         return cachedWebView
     }
@@ -713,7 +713,7 @@ final class BrowserStore {
     }
 
     private func registerBrowserFeaturesIfNeeded(on webView: WKWebView, for tab: BrowserTab) {
-        guard !tab.url.requiresGoogleCompatibilityMode else { return }
+        guard !tab.url.requiresIdentityCompatibilityMode else { return }
         BrowserExtensionManager.shared.registerActiveBrowser(store: self, webView: webView)
         installCompiledContentRuleListIfNeeded(on: webView)
     }
@@ -721,17 +721,22 @@ final class BrowserStore {
     private func switchSelectedWebViewIfNeeded(for url: URL) {
         guard let selectedTabID,
               webViews[selectedTabID] != nil,
-              webViewCompatibilityModes[selectedTabID] != url.requiresGoogleCompatibilityMode else {
+              webViewIdentityCompatibilityModes[selectedTabID] != url.requiresIdentityCompatibilityMode else {
             return
         }
 
         replaceCachedWebView(for: selectedTabID, loading: url)
     }
 
-    func switchWebViewIfNeededForNavigation(to url: URL, from webView: WKWebView) -> Bool {
+    func switchWebViewIfNeededForNavigation(_ request: URLRequest, from webView: WKWebView) -> Bool {
+        guard request.isSafeToReplayAsGet,
+              let url = request.url else {
+            return false
+        }
+
         guard url.isLoadableInMainBrowser,
               let tabID = tabID(for: webView),
-              webViewCompatibilityModes[tabID] != url.requiresGoogleCompatibilityMode else {
+              webViewIdentityCompatibilityModes[tabID] != url.requiresIdentityCompatibilityMode else {
             return false
         }
 
@@ -744,7 +749,12 @@ final class BrowserStore {
 
         guard let index = tabs.firstIndex(where: { $0.id == tabID }) else { return }
         requestedURLs[tabID] = url
-        let replacementWebView = cachedWebView(for: tabs[index])
+        let compatibilityMode = url.requiresIdentityCompatibilityMode
+        let replacementWebView = WKWebView(frame: .zero, configuration: browserConfiguration(isIncognito: tabs[index].isIncognito, googleCompatibilityMode: compatibilityMode))
+        configure(replacementWebView, for: tabID, googleCompatibilityMode: compatibilityMode)
+        webViews[tabID] = replacementWebView
+        webViewIdentityCompatibilityModes[tabID] = compatibilityMode
+        webViewLastUsed[tabID] = Date()
 
         guard tabID == selectedTabID else { return }
         webView = replacementWebView
@@ -773,7 +783,7 @@ final class BrowserStore {
         let identifier = ObjectIdentifier(cachedWebView)
         webViewTabIDs[identifier] = nil
         installedContentRuleListWebViewIDs.remove(identifier)
-        webViewCompatibilityModes[tabID] = nil
+        webViewIdentityCompatibilityModes[tabID] = nil
         webViewLastUsed[tabID] = nil
         if webView === cachedWebView {
             webView = nil
@@ -1379,6 +1389,10 @@ final class BrowserStore {
         if let targetWebView {
             let identifier = ObjectIdentifier(targetWebView)
             guard !installedContentRuleListWebViewIDs.contains(identifier) else { return }
+            if let tabID = webViewTabIDs[identifier],
+               webViewIdentityCompatibilityModes[tabID] == true {
+                return
+            }
             targetWebView.configuration.userContentController.add(contentRuleList)
             installedContentRuleListWebViewIDs.insert(identifier)
             return
@@ -1410,16 +1424,45 @@ private extension URL {
             || host.hasSuffix(".accounts.google.com")
     }
 
-    var requiresGoogleCompatibilityMode: Bool {
-        isGoogleAccountURL
+    var isMicrosoftAccountURL: Bool {
+        guard let host = host(percentEncoded: false)?.lowercased() else { return false }
+        return host == "login.microsoft.com"
+            || host == "login.microsoftonline.com"
+            || host == "login.live.com"
+            || host == "account.live.com"
+            || host == "account.microsoft.com"
+            || host.hasSuffix(".login.microsoft.com")
+            || host.hasSuffix(".login.microsoftonline.com")
+    }
+
+    var requiresIdentityCompatibilityMode: Bool {
+        isGoogleAccountURL || isMicrosoftAccountURL
     }
 
     var isRestorableBrowserURL: Bool {
-        scheme != "webkit-extension" && scheme != "lightbrowser"
+        scheme != "webkit-extension" && scheme != "lightbrowser" && !isTransientIdentityHandoffURL
     }
 
     var isLoadableInMainBrowser: Bool {
         scheme != "webkit-extension" && scheme != "lightbrowser"
+    }
+
+    private var isTransientIdentityHandoffURL: Bool {
+        guard isGoogleAccountURL || isMicrosoftAccountURL else { return false }
+        let lowercasedPath = path(percentEncoded: false).lowercased()
+        return lowercasedPath.contains("/fido/")
+            || lowercasedPath.contains("/saml")
+            || lowercasedPath.contains("/oauth2/")
+            || lowercasedPath.contains("/common/")
+            || lowercasedPath.contains("/consumers/")
+            || lowercasedPath.contains("/accounts/setosid")
+    }
+}
+
+private extension URLRequest {
+    var isSafeToReplayAsGet: Bool {
+        guard let httpMethod else { return true }
+        return httpMethod.uppercased() == "GET" || httpMethod.uppercased() == "HEAD"
     }
 }
 
@@ -1510,7 +1553,7 @@ private final class BrowserWebCoordinator: NSObject, WKNavigationDelegate, WKUID
             if navigationAction.targetFrame?.isMainFrame != false,
                let url = navigationAction.request.url {
                 store?.beginNavigation(to: url, from: webView)
-                if store?.switchWebViewIfNeededForNavigation(to: url, from: webView) == true {
+                if store?.switchWebViewIfNeededForNavigation(navigationAction.request, from: webView) == true {
                     decisionHandler(.cancel)
                     return
                 }
