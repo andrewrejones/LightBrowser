@@ -702,9 +702,7 @@ final class BrowserStore {
     }
 
     private func configure(_ webView: WKWebView, for tabID: BrowserTab.ID, googleCompatibilityMode: Bool) {
-        if !googleCompatibilityMode {
-            webView.customUserAgent = BrowserDefaults.desktopSafariUserAgent
-        }
+        webView.customUserAgent = BrowserDefaults.desktopSafariUserAgent
         webView.allowsBackForwardNavigationGestures = true
         webView.navigationDelegate = webCoordinator
         webView.uiDelegate = webCoordinator
