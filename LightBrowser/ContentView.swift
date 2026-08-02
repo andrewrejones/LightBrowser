@@ -943,6 +943,19 @@ final class BrowserStore {
         }
     }
 
+    func handleMainFrameResponse(_ response: URLResponse, from webView: WKWebView) {
+        guard self.webView === webView,
+              let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 400,
+              let url = httpResponse.url,
+              url.isGoogleAccountURL else {
+            return
+        }
+
+        pageErrorMessage = "Google returned HTTP 400 for this account session page. Open it in Safari to complete Google login."
+        pageRecoveryURL = url
+    }
+
     func beginDownload(_ download: WKDownload) {
         downloadMessage = "Preparing download..."
         downloadManager.track(download) { [weak self] message in
@@ -1432,6 +1445,10 @@ private final class BrowserWebCoordinator: NSObject, WKNavigationDelegate, WKUID
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping @MainActor @Sendable (WKNavigationResponsePolicy) -> Void) {
+        if navigationResponse.isForMainFrame {
+            store?.handleMainFrameResponse(navigationResponse.response, from: webView)
+        }
+
         if navigationResponse.isForMainFrame && !navigationResponse.canShowMIMEType {
             decisionHandler(.download)
         } else {
